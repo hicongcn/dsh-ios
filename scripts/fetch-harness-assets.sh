@@ -89,6 +89,26 @@ case "$SOURCE_KIND" in
       curl -fsSL "$BASE_URL/$asset" -o "$DEST/$asset"
     done
 
+    # The fixtures manifest names overlay archives that supply the sample
+    # workspace. They are not referenced from any page, so they must be read out
+    # of the manifest; skipping them leaves the showcase source broken.
+    OVERLAY_COUNT=$(python3 - "$DEST/preview/fixtures.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as handle:
+    manifest = json.load(handle)
+paths = []
+for fixture in manifest.get('fixtures', []):
+    paths.extend(fixture.get('overlays', []))
+print('\n'.join(paths))
+PY
+)
+    while read -r overlay; do
+      [[ -z "$overlay" ]] && continue
+      mkdir -p "$DEST/preview/$(dirname "$overlay")"
+      echo "    preview/$overlay"
+      curl -fsSL "$BASE_URL/preview/$overlay" -o "$DEST/preview/$overlay"
+    done <<< "$OVERLAY_COUNT"
+
     echo "==> downloading the UI assets"
     mkdir -p "$DEST/assets"
     # Asset names are hashed too, so read them out of the pages and out of the
@@ -114,31 +134,45 @@ fi
 echo
 echo "==> verifying the essential artifacts"
 fail=0
-for required in index.html preview/vfs-image.tar.gz; do
-  if [[ -f "$DEST/$required" ]]; then
-    printf '    OK    %-34s %s\n' "$required" "$(du -h "$DEST/$required" | cut -f1)"
+
+check() {
+  local label="$1"; shift
+  if eval "$@" >/dev/null 2>&1; then
+    printf '    OK    %s\n' "$label"
   else
-    printf '    MISS  %s\n' "$required"
+    printf '    MISS  %s\n' "$label"
     fail=1
   fi
-done
+}
 
-# A worker bundle is mandatory: without it the page cannot boot the harness.
-if ls "$DEST"/preview/worker-*.js >/dev/null 2>&1; then
-  printf '    OK    %-34s %s\n' "preview/worker-*.js" "$(du -ch "$DEST"/preview/worker-*.js | tail -1 | cut -f1)"
-else
-  printf '    MISS  preview/worker-*.js\n'
-  fail=1
-fi
+check "index.html" "[[ -f \"\$DEST/index.html\" ]]"
+check "preview.html" "[[ -f \"\$DEST/preview.html\" ]]"
+check "preview/bootstrap-*.js" "ls \"\$DEST\"/preview/bootstrap-*.js"
+check "preview/worker-*.js" "ls \"\$DEST\"/preview/worker-*.js"
+check "preview/vfs-image.tar.gz" "[[ -f \"\$DEST/preview/vfs-image.tar.gz\" ]]"
+check "preview/fixtures.json" "[[ -f \"\$DEST/preview/fixtures.json\" ]]"
+check "assets/index-*.js" "ls \"\$DEST\"/assets/index-*.js"
 
-if ls "$DEST"/preview/bootstrap-*.js >/dev/null 2>&1; then
-  printf '    OK    %-34s %s\n' "preview/bootstrap-*.js" "$(du -ch "$DEST"/preview/bootstrap-*.js | tail -1 | cut -f1)"
-else
-  printf '    MISS  preview/bootstrap-*.js\n'
-  fail=1
+# Every overlay the manifest promises must be present, otherwise the showcase
+# source fails at boot with a fetch error.
+if [[ -f "$DEST/preview/fixtures.json" ]]; then
+  while read -r overlay; do
+    [[ -z "$overlay" ]] && continue
+    check "preview/$overlay" "[[ -f \"\$DEST/preview/$overlay\" ]]"
+  done < <(python3 - "$DEST/preview/fixtures.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as handle:
+    manifest = json.load(handle)
+for fixture in manifest.get('fixtures', []):
+    for overlay in fixture.get('overlays', []):
+        print(overlay)
+PY
+)
 fi
 
 echo
+# The page's own entry points reference the harness by relative path; a missing
+# worker or image is a silent boot failure on device, so fail the build here.
 echo "    total: $(du -sh "$DEST" | cut -f1)"
 if [[ "$fail" -ne 0 ]]; then
   echo "==> FAILED: required assets are missing" >&2

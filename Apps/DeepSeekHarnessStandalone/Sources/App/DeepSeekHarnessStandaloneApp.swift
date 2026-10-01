@@ -30,6 +30,37 @@ struct DeepSeekHarnessApp: App {
 @Observable
 @MainActor
 final class HarnessModel {
+    /// Which filesystem source the harness boots from.
+    ///
+    /// The preview page renders a developer-facing source chooser unless the
+    /// fixture query says otherwise, so a real client must always pass one.
+    /// These values are the runtime's own sentinels — `EMPTY_SOURCE` is the
+    /// literal `'none'`, not `'empty'` — and the page rejects anything it does
+    /// not recognise, so they are read from `source-chooser.ts` rather than
+    /// inferred. `none` returns no overlays and skips the chooser entirely.
+    enum Source: String, CaseIterable, Identifiable {
+        /// The runtime's `EMPTY_SOURCE`.
+        case empty = "none"
+        /// The bundled sample fixture, by its manifest id.
+        case showcase = "vfs-example"
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .empty: return "Empty environment"
+            case .showcase: return "Showcase sample"
+            }
+        }
+
+        var detail: String {
+            switch self {
+            case .empty: return "Start clean and connect your own model."
+            case .showcase: return "Bundled sample workspace and history."
+            }
+        }
+    }
+
     enum Phase: Equatable {
         case idle
         case starting
@@ -40,18 +71,24 @@ final class HarnessModel {
     private(set) var phase: Phase = .idle
     /// Set when a load error arrives, so the UI can offer a retry.
     private(set) var loadError: String?
+    private(set) var source: Source = .empty
 
     @ObservationIgnored private var server: LocalAssetServer?
     /// Bumped to force SwiftUI to rebuild the web view for a genuine reload.
     private(set) var generation = 0
 
-    /// The bundled harness and the worker-preview entry point.
-    ///
-    /// `preview-fixture` is deliberately omitted: with no query the page shows
-    /// its source chooser, whose default is the empty environment. That is the
-    /// right first run for a real client — the showcase fixture is sample data,
-    /// not the user's own workspace.
+    /// The worker-preview entry point inside the bundled assets.
     private static let entryPath = "preview.html"
+
+    /// The entry URL carrying the source selection.
+    private func entryURL(base: URL) -> URL? {
+        var components = URLComponents(
+            url: URL(string: Self.entryPath, relativeTo: base)!,
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "preview-fixture", value: source.rawValue)]
+        return components?.url
+    }
 
     func start() async {
         guard case .idle = phase else { return }
@@ -65,9 +102,7 @@ final class HarnessModel {
         let server = LocalAssetServer(root: root)
         do {
             try server.start()
-            guard let base = server.baseURL,
-                  let entry = URL(string: Self.entryPath, relativeTo: base)
-            else {
+            guard let base = server.baseURL, let entry = entryURL(base: base) else {
                 server.stop()
                 phase = .failed("The embedded server did not report a usable address.")
                 return
@@ -79,9 +114,22 @@ final class HarnessModel {
         }
     }
 
+    /// Boot the harness from a different filesystem source.
+    func use(_ newSource: Source) {
+        guard newSource != source else { return }
+        source = newSource
+        reload()
+    }
+
     /// Reload the harness from the bundled assets.
     func reload() {
         loadError = nil
+
+        // Rebuilding the web view is the only reliable reset; the URL must be
+        // recomputed because the source may have changed.
+        if case .running = phase, let server, let base = server.baseURL, let entry = entryURL(base: base) {
+            phase = .running(entry)
+        }
         generation += 1
     }
 
@@ -110,6 +158,7 @@ struct ContentView: View {
                     model.reportLoadFailure(message)
                 }
                 .ignoresSafeArea(edges: .bottom)
+                .overlay(alignment: .topTrailing) { SourceMenu() }
             case .failed(let message):
                 FailureView(message: message) {
                     Task { await model.start() }
@@ -121,6 +170,43 @@ struct ContentView: View {
                 LoadErrorBanner(message: error) { model.reload() }
             }
         }
+    }
+}
+
+/// Switches the filesystem source and reloads.
+///
+/// The harness is the app's whole interface, so this stays a small floating
+/// control rather than native chrome that would compete with it.
+private struct SourceMenu: View {
+    @Environment(HarnessModel.self) private var model
+
+    var body: some View {
+        Menu {
+            ForEach(HarnessModel.Source.allCases) { source in
+                Button {
+                    model.use(source)
+                } label: {
+                    if source == model.source {
+                        Label(source.title, systemImage: "checkmark")
+                    } else {
+                        Text(source.title)
+                    }
+                }
+            }
+            Divider()
+            Button {
+                model.reload()
+            } label: {
+                Label("Reload", systemImage: "arrow.clockwise")
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.title3)
+                .padding(8)
+                .background(.thinMaterial, in: Circle())
+        }
+        .padding(.trailing, 12)
+        .padding(.top, 4)
     }
 }
 
