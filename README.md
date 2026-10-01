@@ -1,5 +1,7 @@
 # DeepSeek Harness for iOS
 
+[![iOS Build](https://github.com/hicongcn/dsh-ios/actions/workflows/ios.yml/badge.svg)](https://github.com/hicongcn/dsh-ios/actions/workflows/ios.yml)
+
 A native iOS client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
 It speaks the **same wire protocol as the official browser UI** — the `/api` RPC
@@ -217,7 +219,13 @@ DSH_LIVE_URL="http://…/?token=…" swift run dshkit-selftest   # + live checks
 
 The live checks exercise the real carriers end to end: token exchange,
 `session/list`, `session/create`, the WebSocket snapshot, history paging,
-`session/control`, a real `session/prompt`, and subsequent live events.
+`session/control`, a real `session/prompt`, and subsequent live events — plus a
+socket-drop reconnect and two streams multiplexed concurrently.
+
+CI additionally does what a local run cannot: it compiles the SwiftUI layer with a
+real Xcode, then **boots a simulator, installs the app, launches it and confirms
+the process stays alive**, capturing a screenshot as evidence. Compiling is not
+running, and only CI can prove the latter without Xcode locally.
 
 Two bugs were found and fixed by these checks rather than by inspection:
 
@@ -229,6 +237,18 @@ Two bugs were found and fixed by these checks rather than by inspection:
 - Streaming rows were keyed by attempt id while the committed `assistant/message`
   carries only a turn, so a finished reply appeared twice. A `turn → attempt` map
   now bridges the two and the streamed row is upgraded in place.
+
+CI found three more that a local build could not, because this machine has no Xcode:
+
+- Nesting `Menu → ForEach → Section → ForEach → Button` with optional comparisons
+  made the Swift type checker give up entirely. The picker is now split into
+  `ModelMenu` and `ModelGroupRows` with explicitly typed values.
+- `DSHModelSelection` had **no public initializer**: Swift synthesizes the
+  memberwise one as `internal`, so the app target could not construct it even
+  though the type is `public`. Added an explicit `public init`.
+- The bundle path in the packaging step still used `DeepSeek Harness.app` after
+  `PRODUCT_NAME` was made space-free; that would have broken packaging once
+  compilation succeeded.
 
 ## Limitations
 
