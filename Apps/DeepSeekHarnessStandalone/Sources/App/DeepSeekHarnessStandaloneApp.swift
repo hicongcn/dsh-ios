@@ -374,7 +374,7 @@ struct HarnessWebView: UIViewRepresentable {
     let url: URL
     let generation: Int
     let onLoadError: (String) -> Void
-    /// Called once the harness reports that its plugin tree is live.
+    /// Called once the harness renders its own UI.
     let onBooted: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -386,10 +386,9 @@ struct HarnessWebView: UIViewRepresentable {
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
 
-        // The harness announces its progress with console.log, including the
-        // "tree active" line the worker emits once the plugin tree is up.
-        // Forwarding console output is what lets the app — and CI — assert that
-        // the harness actually booted, rather than that a process merely exists.
+        // Only the page's own console is forwarded. The worker that hosts the
+        // harness has a separate console global, so a main-frame script cannot
+        // see it; liveness is therefore judged from the rendered document.
         let controller = WKUserContentController()
         controller.add(context.coordinator, name: Coordinator.logHandlerName)
         controller.addUserScript(WKUserScript(
@@ -422,10 +421,10 @@ struct HarnessWebView: UIViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         static let logHandlerName = "dshLog"
 
-        /// Mirror console output to the native side.
+        /// Mirror the page's console to the native side.
         ///
         /// Installed before any page script runs so nothing is missed, and it
-        /// re-throws nothing: a failure to post must never break the page.
+        /// never throws: failing to post must not break the page.
         static let consoleForwarder = """
         (function () {
           var post = function (level, args) {
@@ -458,15 +457,81 @@ struct HarnessWebView: UIViewRepresentable {
         var onBooted: (String) -> Void
         var generation = 0
         private var reportedBoot = false
-        /// Bounds the forwarded console output kept on disk. The page logs its
-        /// plugin inventory, which is long enough to matter but finite; a cap
-        /// keeps a chatty failure from filling the container.
+        /// Bounds the forwarded console output kept on disk.
         private static let maxConsoleLines = 400
         private var consoleLines = 0
+        private var probe: Task<Void, Never>?
 
         init(onLoadError: @escaping (String) -> Void, onBooted: @escaping (String) -> Void) {
             self.onLoadError = onLoadError
             self.onBooted = onBooted
+        }
+
+        /// Recognize a rendered harness from the document itself.
+        ///
+        /// Counting elements rather than matching copy keeps this stable across
+        /// translations and copy edits, and it is the only signal available once
+        /// the worker's own console is out of reach.
+        static let probeScript = """
+        (function () {
+          var root = document.getElementById('root');
+          if (!root) { return JSON.stringify({ state: 'no-root' }); }
+          var elements = root.querySelectorAll('*').length;
+          var text = (root.innerText || '').replace(/\\s+/g, ' ').trim();
+          return JSON.stringify({ state: 'ok', elements: elements, text: text.slice(0, 300) });
+        })();
+        """
+
+        /// Poll the rendered document until the harness UI is present.
+        func startProbing(_ webView: WKWebView) {
+            probe?.cancel()
+            probe = Task { [weak self] in
+                // Booting inflates a 14 MB image and mounts 844 modules in a
+                // worker, which is slow on a simulator.
+                for _ in 0..<90 {
+                    if Task.isCancelled { return }
+                    try? await Task.sleep(for: .seconds(2))
+                    if Task.isCancelled { return }
+
+                    let raw: Any?
+                    do {
+                        raw = try await webView.evaluateJavaScript(Self.probeScript)
+                    } catch {
+                        continue
+                    }
+                    guard let self, let json = raw as? String else { continue }
+
+                    if json.contains("\"state\":\"no-root\"") {
+                        BootEvidence.stage("probe: no #root yet")
+                        continue
+                    }
+                    // A rendered harness mounts a large tree; a WebKit error page
+                    // has no #root at all, and a blank page has almost nothing.
+                    if json.contains("\"elements\":") {
+                        let count = Self.elementCount(from: json)
+                        BootEvidence.stage("probe: elements=\(count)")
+                        if count >= Self.minimumRenderedElements {
+                            self.reportedBoot = true
+                            self.onBooted("rendered \(count) elements")
+                            return
+                        }
+                    }
+                }
+                BootEvidence.recordError("harness UI never rendered")
+            }
+        }
+
+        /// The element count below which the UI cannot be considered rendered.
+        ///
+        /// The harness mounts a sidebar, a session header and a composer; the
+        /// threshold is deliberately far below the real count so a design change
+        /// cannot cause a false negative.
+        static let minimumRenderedElements = 40
+
+        static func elementCount(from json: String) -> Int {
+            guard let range = json.range(of: "\"elements\":") else { return 0 }
+            let digits = json[range.upperBound...].prefix { $0.isNumber }
+            return Int(digits) ?? 0
         }
 
         func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -478,17 +543,9 @@ struct HarnessWebView: UIViewRepresentable {
                 consoleLines += 1
                 BootEvidence.stage("console: \(text.prefix(400))")
             }
-
-            // The worker prints this once the whole plugin tree is mounted; it is
-            // the strongest in-page evidence that the harness is running.
-            if !reportedBoot, text.contains("tree active") {
-                reportedBoot = true
-                onBooted(text)
-            }
         }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-            // A fresh navigation may reach the harness after an earlier failure.
             reportedBoot = false
             BootEvidence.stage("navigation started")
         }
@@ -499,19 +556,23 @@ struct HarnessWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             BootEvidence.stage("document finished")
+            startProbing(webView)
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            probe?.cancel()
             report(error)
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            probe?.cancel()
             report(error)
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             // The harness holds a large VFS image in memory; a terminated content
             // process is recoverable by reloading, not a silent blank screen.
+            probe?.cancel()
             BootEvidence.stage("content process terminated")
             onLoadError("The page process was terminated. Reload to continue.")
         }

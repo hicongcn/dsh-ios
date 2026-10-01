@@ -203,7 +203,10 @@ jobs:
 
           LOG="$CONTAINER/Documents/dsh-boot.log"
           BOOTED=0
-          for _ in $(seq 1 36); do
+          # The app probes the rendered document for up to 180s, so the window
+          # here must be at least that long or a slow simulator looks like a
+          # failure.
+          for _ in $(seq 1 48); do
             sleep 5
             if grep -q "^[0-9.]* BOOTED" "$LOG" 2>/dev/null; then
               BOOTED=1
