@@ -198,10 +198,7 @@ struct HarnessWebView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-        configuration.coordinator = context.coordinator
 
-        // The harness keeps its state in the page and reloads often; leaving the
-        // default process pool avoids serialising anything unusual.
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
 
