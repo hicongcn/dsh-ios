@@ -124,8 +124,59 @@ jobs:
             exit 1
           fi
           echo "Found: $SIM_APP"
+          echo "SIM_APP=$SIM_APP" >> "$GITHUB_ENV"
           rm -rf artifacts/simulator && mkdir -p artifacts/simulator
           cp -R "$SIM_APP" artifacts/simulator/
+
+      # Compiling is not running. This boots a simulator, installs the app, and
+      # launches it, so a crash in app startup fails the build instead of being
+      # discovered by hand later. A screenshot is captured as evidence.
+      - name: Smoke-launch on a simulator
+        run: |
+          set -euo pipefail
+
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          for runtime, entries in sorted(devices.items()):
+              if "iOS" not in runtime:
+                  continue
+              for device in entries:
+                  if device["name"].startswith("iPhone"):
+                      print(device["udid"])
+                      raise SystemExit
+          raise SystemExit("no available iPhone simulator")
+          ')
+          echo "Simulator: $UDID"
+
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+
+          xcrun simctl install "$UDID" "$SIM_APP"
+
+          # launch prints "<bundle-id>: <pid>"
+          xcrun simctl launch "$UDID" ai.deepseek.harness.ios
+
+          # If the process died during startup, it will not be listed.
+          sleep 6
+          if xcrun simctl spawn "$UDID" launchctl list | grep -q ai.deepseek.harness.ios; then
+            echo "App is running."
+          else
+            echo "::error::App is not running after launch — it likely crashed on startup."
+            xcrun simctl spawn "$UDID" log show --last 2m --predicate 'processImagePath CONTAINS "DeepSeekHarness"' 2>/dev/null | tail -40 || true
+            exit 1
+          fi
+
+          mkdir -p artifacts/screenshots
+          xcrun simctl io "$UDID" screenshot artifacts/screenshots/connect-screen.png
+          ls -lh artifacts/screenshots
+
+      - name: Upload launch screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeekHarness-screenshot
+          path: artifacts/screenshots/
+          if-no-files-found: warn
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
