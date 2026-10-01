@@ -16,41 +16,10 @@ struct ConversationView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Menu {
-                    if let catalog = state.catalog {
-                        ForEach(catalog.groups) { group in
-                            Section(group.name) {
-                                ForEach(group.models, id: \.id) { model in
-                                    Button {
-                                        Task {
-                                            await state.selectModel(
-                                                DSHModelSelection(
-                                                    provider: group.id,
-                                                    model: model.id,
-                                                    reasoningEffort: nil
-                                                )
-                                            )
-                                        }
-                                    } label: {
-                                        if state.activeModel?.provider == group.id,
-                                           state.activeModel?.model == model.id {
-                                            Label(model.name, systemImage: "checkmark")
-                                        } else {
-                                            Text(model.name)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Divider()
-                    Button {
-                        Task { await state.forkSelected() }
-                    } label: {
-                        Label("Fork from here", systemImage: "arrow.triangle.branch")
-                    }
-                } label: {
-                    Label("Model", systemImage: "cpu")
+                ModelMenu(catalog: state.catalog, active: state.activeModel) { selection in
+                    Task { await state.selectModel(selection) }
+                } onFork: {
+                    Task { await state.forkSelected() }
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
@@ -72,6 +41,72 @@ struct ConversationView: View {
         .overlay(alignment: .top) {
             if !state.queued.isEmpty {
                 QueueBanner(count: state.queued.count)
+            }
+        }
+    }
+}
+
+/// Model picker plus the fork action.
+///
+/// Extracted from the toolbar on purpose: nested `Menu → ForEach → Section →
+/// ForEach → Button → if/else` combined with optional comparisons makes Swift's
+/// type checker time out ("unable to type-check this expression in reasonable
+/// time"). Small dedicated views keep each expression shallow and give the
+/// compiler something it can solve.
+private struct ModelMenu: View {
+    let catalog: DSHModelCatalog?
+    let active: DSHModelSelection?
+    let onSelect: (DSHModelSelection) -> Void
+    let onFork: () -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(catalog?.groups ?? []) { group in
+                Section(group.name) {
+                    ForEach(group.models, id: \.id) { model in
+                        ModelMenuRow(
+                            model: model,
+                            isActive: isActive(group: group.id, model: model.id)
+                        ) {
+                            onSelect(DSHModelSelection(
+                                provider: group.id,
+                                model: model.id,
+                                reasoningEffort: nil
+                            ))
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            Button(action: onFork) {
+                Label("Fork from here", systemImage: "arrow.triangle.branch")
+            }
+        } label: {
+            Label("Model", systemImage: "cpu")
+        }
+    }
+
+    /// Whether this exact route is the one the next request will use.
+    private func isActive(group: String, model: String) -> Bool {
+        guard let active else { return false }
+        return active.provider == group && active.model == model
+    }
+}
+
+/// One model row, with a checkmark when it is the active route.
+private struct ModelMenuRow: View {
+    let model: DSHModelCatalogModel
+    let isActive: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            if isActive {
+                Label(model.name, systemImage: "checkmark")
+            } else {
+                Text(model.name)
             }
         }
     }
