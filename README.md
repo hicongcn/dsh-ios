@@ -2,257 +2,169 @@
 
 [![iOS Build](https://github.com/hicongcn/dsh-ios/actions/workflows/ios.yml/badge.svg)](https://github.com/hicongcn/dsh-ios/actions/workflows/ios.yml)
 
-A native iOS client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
+Native iOS clients for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness),
+built from its own source. Two apps, one protocol package:
 
-It speaks the **same wire protocol as the official browser UI** — the `/api` RPC
-channel and the `/api/remote.mux` WebSocket mux — so it is not a reimplementation
-with its own state. A session you start on the phone is the same durable session
-the desktop client sees, and vice versa.
-
-```
-┌─────────────────────┐        POST /api/<endpoint>        ┌──────────────────────┐
-│  iPhone / iPad      │  ───────────────────────────────▶  │                      │
-│  DeepSeek Harness   │        {type:client-request,...}   │   dsh web host       │
-│                     │  ◀───────────────────────────────  │   (your computer)    │
-│  DSHKit + SwiftUI   │        WSS /api/remote.mux         │                      │
-└─────────────────────┘   {type:item|end|error,streamId}   └──────────────────────┘
-```
-
-## What works
-
-- **Connect** by pasting the URL that `dsh web` prints. Its `?token=` is exchanged
-  for the signed `dsh-auth-…` cookie exactly as the browser does, then stored in
-  the Keychain so later launches reconnect without a token.
-- **Sessions**: list, create (with a working directory), rename, fork, and read
-  backwards history pages.
-- **Live conversation**: the opening snapshot, then durable events streamed as
-  they happen, including process-local assistant chunks so text appears while it
-  is still being generated.
-- **Queue and jobs**: the `session/control` stream drives the pending-prompt count
-  and background-job rows.
-- **Models and skills**: the routable catalog is read from the Host and selection
-  is written back per session.
-
-## Requirements
-
-| Piece | Needs |
-| --- | --- |
-| `DSHKit` protocol layer + self-test | macOS 13+ with command line tools (no Xcode) |
-| SwiftUI app + `.ipa` | Xcode, iOS 17+ deployment target, `xcodegen` |
-
-The split is deliberate: the protocol layer has no iOS-only dependency, so it is
-verifiable on any Mac, and only the UI shell requires Xcode.
-
-## Quick start
-
-```bash
-# 1. On your computer, start a Harness host and copy the printed URL.
-dsh web
-
-# 2. Verify the protocol layer (offline + live against that host).
-./scripts/build.sh --live "http://127.0.0.1:3080/?token=…"
-
-# 3. Generate the Xcode project and run the app.
-brew install xcodegen
-xcodegen generate
-open DeepSeekHarness.xcodeproj
-```
-
-Then paste the URL from step 1 into the connect screen.
-
-### Simulator vs device
-
-The simulator shares the Mac's loopback, so `http://127.0.0.1:3080` works
-directly. A physical device needs the Host's LAN address instead:
-
-```bash
-dsh web --host 0.0.0.0 --trusted-host 192.168.1.20:3080
-```
-
-Use the **LAN** URL it prints. The `/api` fence refuses any authority that is
-neither loopback nor declared as trusted, so an undeclared LAN address is rejected
-with `403` — that is the fence working, not a client bug.
-
-Cleartext HTTP is permitted only for `localhost`, `127.0.0.1`, and local
-networking (see `NSAppTransportSecurity` in `project.yml`). Reaching a Host
-through a public hostname requires TLS or an added exception.
-
-## Architecture
-
-```
-Sources/DSHKit/
-  Wire/
-    DSHJSON.swift            lossless JSON value (no non-finite numbers, no -0)
-    DSHWireEnvelope.swift    client-request / server-response + mux frames
-    DSHModels.swift          typed session, catalog, timeline, control models
-    DSHTimeline.swift        folds events + chunks into displayable rows
-  Transport/
-    DSHHostConfiguration.swift  parses the dsh web URL, derives /api and ws routes
-    DSHAuthBootstrap.swift      token exchange, Keychain and in-memory stores
-    DSHRPCClient.swift          one POST per endpoint, rpcId-verified
-    DSHStreamMux.swift          one socket, many concurrent logical streams
-  API/
-    DSHClient.swift             the session facade the app calls
-
-Apps/DeepSeekHarness/Sources/
-  App/DeepSeekHarnessApp.swift
-  Model/AppState.swift          @Observable, @MainActor connection + timeline state
-  Views/ConnectView.swift       paste-URL entry
-  Views/MainView.swift          session list
-  Views/ConversationView.swift  transcript, prompt bar, model picker
-```
-
-## Protocol notes
-
-Details that a reimplementation must get right, all verified against a live host:
-
-- **Envelope.** `POST /api/<endpoint>` with
-  `{"type":"client-request","rpcId":…,"method":…,"payload":{"args":{…}}}`. The
-  response is `{"type":"server-response","rpcId":…,"result":{"ok":true,"value":…}}`
-  or `{"ok":false,"error":{"code","message","details"}}`. The `rpcId` is minted by
-  the caller and **must** be verified; the client rejects a mismatch rather than
-  delivering the wrong value.
-- **Arguments.** Every method takes exactly one `request` field (some take
-  `_request`). This is confirmed by the generated descriptors in
-  `@deepseek-ai/dsh-api-session-controller/typert.host.js`.
-- **Streams.** One WebSocket carries all logical streams. Open with
-  `{"type":"open","streamId","endpoint","payload":{"args":…}}`; the Host replies
-  `{"type":"item","streamId","value"}`, then `end` or `error`. Keys must match
-  exactly — extra or missing keys make the Host reject the frame.
-- **Auth.** `GET /?token=…` returns `303` with `Set-Cookie: dsh-auth-<sha256(authority)>=v1.<payload>.<hmac>`.
-  The cookie is bound to the request authority, so it is stored per `host:port`.
-  A restarted Host rotates its signing secret, which invalidates old cookies —
-  `DSHClient` therefore retries once with a fresh token exchange on `401`.
-- **Origin.** A missing `Origin` header passes the fence, which is what lets a
-  native client connect at all. `Host` must be loopback or declared trusted.
-- **Heartbeats.** The Host pings; two missed pongs drop the socket. The client
-  surfaces that as a stream failure so the caller can re-follow.
-
-### Behavior inherited from the Host
-
-A cancelled or dropped follow stream is not an error: the next `session/follow`
-re-opens with a fresh snapshot, which is how reconnect resyncs. `DSHTimeline`
-applies snapshots by replacing its opening window, so re-following is safe.
-
-Session deletion is **not** exposed by the protocol (only workspace archiving), so
-the app offers no delete action rather than implying one.
-
-## Building the IPA without a local Xcode
-
-If Xcode is not installed locally, GitHub Actions builds the app for you — the
-macOS runner has Xcode preinstalled. Two workflows are provided:
-
-| Workflow | Needs secrets | Produces |
+| App | What it is | Size |
 | --- | --- | --- |
-| `.github/workflows/ios.yml` | none | unsigned `.ipa`, device `.app`, simulator `.app` |
-| `.github/workflows/ios-signed.yml` | signing identity | signed, device-installable `.ipa` |
+| **DeepSeekHarness** (standalone) | The whole harness embedded in the app. Runs on device with no host. | ~14 MB |
+| **DeepSeekHarnessClient** | A thin client for a `dsh web` host running on your computer. | ~350 KB |
 
-The unsigned workflow runs on every push. Download the artifact from the run
-summary, or with the CLI:
+Both speak the upstream wire protocol or run the upstream runtime, so neither
+reimplements the product.
 
-```bash
-gh run list --repo <owner>/dsh-ios
-gh run watch --repo <owner>/dsh-ios
-gh run download --repo <owner>/dsh-ios -n DeepSeekHarness-unsigned-ipa
+```
+┌─ DeepSeekHarness (standalone) ───────────────────────────┐
+│  SwiftUI shell  →  LocalAssetServer (127.0.0.1)          │
+│                        ↓                                 │
+│  WKWebView  →  preview.html  →  Web Worker (harness)     │
+│                                    ↓ inflates            │
+│                              vfs-image.tar.gz            │
+│                              (844 modules, no Node host) │
+└──────────────────────────────────────────────────────────┘
 ```
 
-### What an unsigned IPA can and cannot do
-
-An unsigned `.ipa` is a real arm64 build — it is the same binary a signed build
-produces, just without a signature. That has concrete consequences:
-
-- **Cannot** be installed on a physical device by iTunes, Apple Configurator, or
-  `ideviceinstaller`. iOS refuses to run an unsigned binary, and there is no
-  supported way around that on a stock device.
-- **Can** be inspected, diffed, and re-signed later with `codesign` if you obtain
-  an identity.
-- **Can** be installed on a jailbroken device, which is the one case where an
-  unsigned bundle is directly runnable.
-
-For anything you actually want to use on your iPhone, either sign it (below) or
-use the simulator build, which runs on any Mac with Xcode:
+## Download a build
 
 ```bash
-xcrun simctl install booted <path>/DeepSeekHarness.app
-xcrun simctl launch booted ai.deepseek.harness.ios
+gh run download --repo hicongcn/dsh-ios -n DeepSeekHarnessStandalone-unsigned-ipa
 ```
 
-### Signing
+Or from the [Actions page](https://github.com/hicongcn/dsh-ios/actions/workflows/ios.yml):
+open a green run and take the artifact you want.
 
-A Development or Ad Hoc profile requires a paid Apple Developer account; a free
-Apple ID cannot create one. Once you have it, add four repository secrets and run
-the signed workflow:
+## How the standalone app works
+
+The harness is a Web Worker application: the page starts a worker, the worker
+inflates a packed VFS image and boots the full plugin tree. WebKit gives a
+`file://` page **no origin at all**, and a worker cannot start without one. So
+`WKWebView.loadFileURL` cannot work here, and the app serves its own bundle over
+`127.0.0.1` instead — an origin with no off-device surface.
+
+`DSHAssetServer` is that server. It binds loopback only, answers `GET`/`HEAD`
+only, and confines every resolved path to the served root. Its self-test asserts
+the invariant that matters — *no request resolves outside the root* — rather than
+a list of forbidden strings, so inputs nobody enumerated are still covered.
+
+The assets themselves are not in this repository. They are build products of the
+upstream project (16 MB, mostly the 14 MB VFS image), so
+`scripts/fetch-harness-assets.sh` downloads them and the app icon is generated
+from the upstream brand mark. Committing them would add binaries that silently
+drift from whatever built them.
+
+### Boot sources
+
+The preview page renders a developer-facing source chooser unless it is told
+otherwise, so the app always passes a source and offers a switcher in place of
+the chooser it replaces:
+
+| In-app name | Query value | Effect |
+| --- | --- | --- |
+| Empty environment | `preview-fixture=none` | Clean start; connect your own model. |
+| Showcase sample | `preview-fixture=vfs-example` | Bundled sample workspace and history. |
+
+`none` is the runtime's own sentinel for "no overlays" — the literal string
+`none`, not `empty`; the page rejects anything it does not recognise.
+
+## Building it yourself
+
+Requires Xcode and `xcodegen`.
+
+```bash
+brew install xcodegen
+./scripts/fetch-harness-assets.sh     # pull the harness into the app bundle
+python3 scripts/make-app-icon.py      # needs Pillow and rsvg-convert
+xcodegen generate
+open DeepSeekHarness.xcodeproj        # pick a scheme, run on iOS 17+
+```
+
+CI does exactly this on a macOS runner (`.github/workflows/ios.yml`) and then
+smoke-launches the app on a simulator, confirming the process stays alive and
+capturing a screenshot — compiling is not running.
+
+### Pointing at a different harness build
+
+```bash
+HARNESS_ASSETS_URL=https://your.host/path ./scripts/fetch-harness-assets.sh
+```
+
+The script discovers content-hashed filenames from the served pages and the
+bootstrap module rather than pinning hashes, and verifies every overlay the
+fixtures manifest promises.
+
+## Signing
+
+An unsigned `.ipa` is a real arm64 binary, but iOS will not install it on a
+stock device, and there is no supported way around that. For a device-installable
+build you need a Development or Ad Hoc profile, which requires a paid Apple
+Developer account (a free Apple ID cannot create one).
+
+Add four repository secrets and run the signed workflow:
 
 | Secret | Value |
 | --- | --- |
 | `BUILD_CERTIFICATE_BASE64` | `base64 -i Certificates.p12` |
 | `P12_PASSWORD` | the `.p12` export password |
 | `BUILD_PROVISION_PROFILE_BASE64` | `base64 -i profile.mobileprovision` |
-| `KEYCHAIN_PASSWORD` | any throwaway string for the temporary keychain |
-
-Then either push a `v*` tag or trigger it manually:
+| `KEYCHAIN_PASSWORD` | any throwaway string |
 
 ```bash
-gh workflow run ios-signed.yml --repo <owner>/dsh-ios
+gh workflow run ios-signed.yml --repo hicongcn/dsh-ios
 ```
 
-The signing certificate, profile, and keychain are all removed from the runner at
-the end of the job; nothing is persisted.
-
-### Pushing a workflow file
-
-GitHub refuses to accept a workflow file from an OAuth token that lacks the
-`workflow` scope. If the push is rejected with that message, grant it once:
+Without signing, the simulator build is fully usable:
 
 ```bash
-gh auth refresh -h github.com -s workflow
+xcrun simctl install booted DeepSeekHarness.app
+xcrun simctl launch booted ai.deepseek.harness.standalone
 ```
 
 ## Verification
 
-`./scripts/build.sh` runs the check suite; `--live URL` adds real-host integration.
+`swift run` the two self-test executables; neither needs Xcode.
 
 ```bash
-swift run dshkit-selftest                    # offline checks
-DSH_LIVE_URL="http://…/?token=…" swift run dshkit-selftest   # + live checks
+swift build
+swift run dshkit-selftest             # 110 checks
+swift run dsh-asset-server-selftest   # 56 checks
 ```
 
-The live checks exercise the real carriers end to end: token exchange,
-`session/list`, `session/create`, the WebSocket snapshot, history paging,
-`session/control`, a real `session/prompt`, and subsequent live events — plus a
-socket-drop reconnect and two streams multiplexed concurrently.
+`dshkit-selftest` covers the wire protocol, including live checks against a real
+`dsh web` host when `DSH_LIVE_URL` is set (token exchange, session list/create,
+streaming snapshot, paging, control stream, prompt, reconnect, concurrent
+multiplexing). `dsh-asset-server-selftest` covers path resolution, traversal
+refusal, content types, request parsing, and the live server over real sockets.
 
-CI additionally does what a local run cannot: it compiles the SwiftUI layer with a
-real Xcode, then **boots a simulator, installs the app, launches it and confirms
-the process stays alive**, capturing a screenshot as evidence. Compiling is not
-running, and only CI can prove the latter without Xcode locally.
+### Bugs these checks found
 
-Two bugs were found and fixed by these checks rather than by inspection:
+Found by running, not by reading:
 
-- `JSONSerialization` bridges `NSNumber` such that `1 as? Bool` is `true`. Reading
-  booleans by casting silently turned the number `1` into a boolean, which broke
-  `header.version` and any todo payload containing a numeric `1`. Booleans are now
-  identified through `CFBoolean`, with a regression test over `0`, `1`, `2`,
-  `1.5`, `-1`, `true`, and `false`.
-- Streaming rows were keyed by attempt id while the committed `assistant/message`
-  carries only a turn, so a finished reply appeared twice. A `turn → attempt` map
-  now bridges the two and the streamed row is upgraded in place.
-
-CI found three more that a local build could not, because this machine has no Xcode:
-
-- Nesting `Menu → ForEach → Section → ForEach → Button` with optional comparisons
-  made the Swift type checker give up entirely. The picker is now split into
-  `ModelMenu` and `ModelGroupRows` with explicitly typed values.
-- `DSHModelSelection` had **no public initializer**: Swift synthesizes the
-  memberwise one as `internal`, so the app target could not construct it even
-  though the type is `public`. Added an explicit `public init`.
-- The bundle path in the packaging step still used `DeepSeek Harness.app` after
-  `PRODUCT_NAME` was made space-free; that would have broken packaging once
-  compilation succeeded.
+- `JSONSerialization` bridges `NSNumber` so that `1 as? Bool` is `true`, which
+  silently turned the number `1` into a boolean and broke `header.version`.
+  Booleans now go through `CFBoolean`, with a regression test.
+- Streamed assistant rows were keyed by attempt id while the committed message
+  carries only a turn, so a finished reply rendered twice.
+- `DSHModelSelection` had no public initializer — Swift synthesizes it as
+  `internal`, so the app could not construct one across the module boundary.
+- Nested `Menu → ForEach → Section → ForEach → Button` defeated the Swift type
+  checker outright.
+- The app sent no fixture query, so it booted to the developer chooser instead of
+  the harness; and it used `empty` where the runtime expects `none`.
+- The fetch script dropped the fixture overlay archives, which are named only
+  inside `fixtures.json`, leaving the showcase source broken.
 
 ## Limitations
 
-- No destructive session delete (not in the protocol).
-- No image or file attachment upload yet; `PromptContentPart` supports text.
-- The control stream is re-established on reconnect rather than resumed.
-- The app targets one Host at a time.
+- **Unsigned builds do not install on a stock device.** Use the simulator, or
+  sign it.
+- **Model access needs your own API key.** The harness calls the model API from
+  the page; the app stores nothing and proxies nothing. DeepSeek's API sends the
+  CORS headers a browser client needs, which is what makes this work at all.
+- **The embedded runtime is upstream's `experimental` package.** The worker
+  confinement is a VFS boundary, not kernel isolation; the shell is not bash; and
+  `git`, native DNS, and package installation are unavailable by design.
+- The standalone app targets one embedded harness build; changing it means
+  re-fetching assets.
+- The client app requires a reachable `dsh web` host. For a LAN host, start it
+  with `--host 0.0.0.0 --trusted-host <your-ip>:<port>`; the `/api` fence refuses
+  authorities it was not told about.
