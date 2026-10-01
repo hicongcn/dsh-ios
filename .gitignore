@@ -1,0 +1,13 @@
+.DS_Store
+.build/
+build/
+DerivedData/
+artifacts/
+Payload/
+*.xcarchive
+*.ipa
+
+# xcodegen output — project.yml is the source of truth, so the generated
+# project is rebuilt in CI and never committed (avoids pbxproj merge conflicts).
+DeepSeekHarness.xcodeproj/
+xcuserdata/
