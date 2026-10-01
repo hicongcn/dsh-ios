@@ -135,6 +135,77 @@ applies snapshots by replacing its opening window, so re-following is safe.
 Session deletion is **not** exposed by the protocol (only workspace archiving), so
 the app offers no delete action rather than implying one.
 
+## Building the IPA without a local Xcode
+
+If Xcode is not installed locally, GitHub Actions builds the app for you — the
+macOS runner has Xcode preinstalled. Two workflows are provided:
+
+| Workflow | Needs secrets | Produces |
+| --- | --- | --- |
+| `.github/workflows/ios.yml` | none | unsigned `.ipa`, device `.app`, simulator `.app` |
+| `.github/workflows/ios-signed.yml` | signing identity | signed, device-installable `.ipa` |
+
+The unsigned workflow runs on every push. Download the artifact from the run
+summary, or with the CLI:
+
+```bash
+gh run list --repo <owner>/dsh-ios
+gh run watch --repo <owner>/dsh-ios
+gh run download --repo <owner>/dsh-ios -n DeepSeekHarness-unsigned-ipa
+```
+
+### What an unsigned IPA can and cannot do
+
+An unsigned `.ipa` is a real arm64 build — it is the same binary a signed build
+produces, just without a signature. That has concrete consequences:
+
+- **Cannot** be installed on a physical device by iTunes, Apple Configurator, or
+  `ideviceinstaller`. iOS refuses to run an unsigned binary, and there is no
+  supported way around that on a stock device.
+- **Can** be inspected, diffed, and re-signed later with `codesign` if you obtain
+  an identity.
+- **Can** be installed on a jailbroken device, which is the one case where an
+  unsigned bundle is directly runnable.
+
+For anything you actually want to use on your iPhone, either sign it (below) or
+use the simulator build, which runs on any Mac with Xcode:
+
+```bash
+xcrun simctl install booted <path>/DeepSeekHarness.app
+xcrun simctl launch booted ai.deepseek.harness.ios
+```
+
+### Signing
+
+A Development or Ad Hoc profile requires a paid Apple Developer account; a free
+Apple ID cannot create one. Once you have it, add four repository secrets and run
+the signed workflow:
+
+| Secret | Value |
+| --- | --- |
+| `BUILD_CERTIFICATE_BASE64` | `base64 -i Certificates.p12` |
+| `P12_PASSWORD` | the `.p12` export password |
+| `BUILD_PROVISION_PROFILE_BASE64` | `base64 -i profile.mobileprovision` |
+| `KEYCHAIN_PASSWORD` | any throwaway string for the temporary keychain |
+
+Then either push a `v*` tag or trigger it manually:
+
+```bash
+gh workflow run ios-signed.yml --repo <owner>/dsh-ios
+```
+
+The signing certificate, profile, and keychain are all removed from the runner at
+the end of the job; nothing is persisted.
+
+### Pushing a workflow file
+
+GitHub refuses to accept a workflow file from an OAuth token that lacks the
+`workflow` scope. If the push is rejected with that message, grant it once:
+
+```bash
+gh auth refresh -h github.com -s workflow
+```
+
 ## Verification
 
 `./scripts/build.sh` runs the check suite; `--live URL` adds real-host integration.

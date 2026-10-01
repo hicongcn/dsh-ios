@@ -1,0 +1,144 @@
+name: iOS Build
+
+# Builds the Harness iOS client on a macOS runner, where Xcode is available.
+#
+# Two independent jobs:
+#   protocol  — fast gate; DSHKit has no iOS-only dependency, so it builds and
+#               self-tests without Xcode. Runs on every push.
+#   ipa       — the actual app build. Needs Xcode, so it runs on the macOS
+#               runner and produces an installable artifact.
+#
+# An unsigned .ipa is produced by default. See "Signing" in README.md for the
+# secret-backed signed path, which is what installs on a physical device.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_signed:
+        description: "Also attempt a signed build (requires signing secrets)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  protocol:
+    name: Protocol layer + self-test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build DSHKit
+        run: swift build
+
+      - name: Self-test (offline checks)
+        run: swift run dshkit-selftest
+
+      # Live checks need a reachable `dsh web` host, which a runner does not
+      # have. The suite prints a reminder and still passes, so no host is faked
+      # here — an integration test that quietly no-ops is worse than none.
+
+  ipa:
+    name: Build app + package IPA
+    runs-on: macos-latest
+    needs: protocol
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios || true
+          swift --version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate the Xcode project
+        run: xcodegen generate
+
+      # Device build, unsigned. CODE_SIGNING_ALLOWED=NO is what lets a runner
+      # with no certificates produce a real arm64 app binary.
+      - name: Build for device (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project DeepSeekHarness.xcodeproj \
+            -scheme DeepSeekHarness \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      # An .ipa is a zip whose root holds Payload/<App>.app. Assembling it by
+      # hand is what makes the unsigned artifact producible without a team.
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="build/Build/Products/Release-iphoneos/DeepSeek Harness.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "App bundle not found at: $APP_PATH" >&2
+            ls -la build/Build/Products/ || true
+            exit 1
+          fi
+          rm -rf artifacts Payload
+          mkdir -p artifacts Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry "artifacts/DeepSeekHarness-unsigned.ipa" Payload
+          # Also keep the raw .app: it is directly usable by tooling that
+          # expects a bundle rather than a packaged archive.
+          cp -R "$APP_PATH" artifacts/
+          ls -lh artifacts
+
+      # A simulator build is genuinely useful: it runs on any Mac with Xcode,
+      # so the UI can be exercised without a signing identity.
+      - name: Build for simulator
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project DeepSeekHarness.xcodeproj \
+            -scheme DeepSeekHarness \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build-sim \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package simulator app
+        run: |
+          set -euo pipefail
+          SIM_APP=$(find build-sim/Build/Products -maxdepth 2 -name "*.app" -type d | head -1)
+          if [ -z "$SIM_APP" ]; then
+            echo "Simulator app bundle not found" >&2
+            exit 1
+          fi
+          echo "Found: $SIM_APP"
+          rm -rf artifacts/simulator && mkdir -p artifacts/simulator
+          cp -R "$SIM_APP" artifacts/simulator/
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeekHarness-unsigned-ipa
+          path: artifacts/DeepSeekHarness-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload raw app bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeekHarness-app-bundles
+          path: |
+            artifacts/DeepSeek Harness.app
+            artifacts/simulator/
+          if-no-files-found: warn
