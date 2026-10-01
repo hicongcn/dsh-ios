@@ -118,6 +118,17 @@ public struct DSHModelSelection: Codable, Sendable, Hashable {
     public let provider: String
     public let model: String
     public let reasoningEffort: String?
+
+    /// Explicit memberwise initializer.
+    ///
+    /// Swift's synthesized one is `internal`, so it is invisible to the app
+    /// target even though the type itself is public — a cross-module caller
+    /// cannot construct a selection without this.
+    public init(provider: String, model: String, reasoningEffort: String? = nil) {
+        self.provider = provider
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+    }
 }
 
 /// One todo row carried by the `todos` projection.

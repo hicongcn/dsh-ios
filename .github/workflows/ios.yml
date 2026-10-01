@@ -86,7 +86,7 @@ jobs:
       - name: Package unsigned IPA
         run: |
           set -euo pipefail
-          APP_PATH="build/Build/Products/Release-iphoneos/DeepSeek Harness.app"
+          APP_PATH="build/Build/Products/Release-iphoneos/DeepSeekHarness.app"
           if [ ! -d "$APP_PATH" ]; then
             echo "App bundle not found at: $APP_PATH" >&2
             ls -la build/Build/Products/ || true
@@ -139,6 +139,6 @@ jobs:
         with:
           name: DeepSeekHarness-app-bundles
           path: |
-            artifacts/DeepSeek Harness.app
+            artifacts/DeepSeekHarness.app
             artifacts/simulator/
           if-no-files-found: warn
