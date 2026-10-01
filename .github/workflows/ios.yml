@@ -73,8 +73,16 @@ jobs:
 
       - name: Generate the app icon from the harness brand mark
         run: |
-          python3 -m pip install --quiet Pillow
-          python3 scripts/make-app-icon.py
+          set -euo pipefail
+          # rsvg-convert comes from librsvg, which is not guaranteed on the image.
+          if ! command -v rsvg-convert >/dev/null 2>&1; then
+            brew install librsvg
+          fi
+          # The runner's Homebrew Python refuses a bare `pip install` (PEP 668),
+          # so Pillow goes into a throwaway virtual environment.
+          python3 -m venv "$RUNNER_TEMP/iconenv"
+          "$RUNNER_TEMP/iconenv/bin/pip" install --quiet Pillow
+          "$RUNNER_TEMP/iconenv/bin/python" scripts/make-app-icon.py
 
       - name: Generate the Xcode project
         run: xcodegen generate
