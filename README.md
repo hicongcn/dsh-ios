@@ -153,6 +153,38 @@ Found by running, not by reading:
 - The fetch script dropped the fixture overlay archives, which are named only
   inside `fixtures.json`, leaving the showcase source broken.
 
+### A false positive worth recording
+
+The standalone app was reported working when it had never loaded. Its screen
+showed WebKit's "The URL can't be shown" the whole time.
+
+Three separate mistakes stacked up:
+
+- The smoke test checked that the **process stayed alive**. WebKit's error page
+  keeps a process alive while rendering nothing, so that proved only that a
+  binary was running.
+- The screenshot was judged by **colour distribution** — "754 distinct colours,
+  therefore a rendered UI". An error page has colours too. OCR of those same
+  screenshots reads the error text immediately.
+- The entry URL was built with `URLComponents(url:relativeTo:)` and
+  `resolvingAgainstBaseURL: false`, which keeps a relative URL relative. It lost
+  scheme, host and port, and the web view refused it.
+
+The fix is layered, so no single mistake can hide the result again:
+
+1. The app writes a stage-by-stage log into its own container and CI reads it
+   back with `simctl get_app_container`; that is what showed the URL, the
+   navigation and the element count at each step.
+2. Liveness is judged by polling the rendered document for mounted elements,
+   not by a console line. `tree active` is printed *inside the Web Worker*, and
+   a worker has its own console global — a main-frame script can never see it,
+   which is why an earlier attempt waited for a line that could not arrive.
+3. CI OCRs the screenshot and fails on WebKit load-error wording, so the app's
+   own log cannot pass a page that renders an error.
+
+It now reports `BOOTED rendered 126 elements`, and the screenshot reads as the
+harness's own preview notice.
+
 ## Limitations
 
 - **Unsigned builds do not install on a stock device.** Use the simulator, or
