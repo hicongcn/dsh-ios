@@ -2,6 +2,52 @@ import SwiftUI
 import WebKit
 import DSHAssetServer
 
+/// Evidence the app leaves on disk for an automated smoke test.
+///
+/// Console output proved unreliable across launch modes — `simctl launch
+/// --console-pty` produced an empty log on CI — so the app records what it knows
+/// in its own container, where a test can read it deterministically. This exists
+/// because a live process turned out to be a false positive: WebKit's own
+/// "The URL can't be shown" page keeps the process alive while rendering nothing.
+enum BootEvidence {
+    /// Append-only progress log, so a failure can be placed exactly rather than
+    /// inferred from a screenshot.
+    static let logFile = "dsh-boot.log"
+
+    private static var directory: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+    }
+
+    /// Record one startup stage.
+    static func stage(_ line: String) {
+        append(line)
+    }
+
+    /// Record a successful harness boot.
+    static func recordBooted(_ detail: String) {
+        append("BOOTED \(detail)")
+    }
+
+    /// Record a failure with enough context to act on it.
+    static func recordError(_ message: String) {
+        append("ERROR \(message)")
+    }
+
+    private static func append(_ line: String) {
+        guard let directory else { return }
+        let url = directory.appendingPathComponent(logFile)
+        let stamped = Data("\(Date().timeIntervalSince1970) \(line)\n".utf8)
+
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: stamped)
+        } else {
+            try? stamped.write(to: url, options: .atomic)
+        }
+    }
+}
+
 /// The standalone DeepSeek Harness client.
 ///
 /// This app ships the whole harness inside its own bundle: the Web Worker
@@ -107,23 +153,29 @@ final class HarnessModel {
     func start() async {
         guard case .idle = phase else { return }
         phase = .starting
+        BootEvidence.stage("start source=\(source.rawValue)")
 
         guard let root = Bundle.main.url(forResource: "HarnessAssets", withExtension: nil) else {
+            BootEvidence.recordError("bundled assets missing")
             phase = .failed("The bundled harness assets are missing from this build.")
             return
         }
+        BootEvidence.stage("assets at \(root.path)")
 
         let server = LocalAssetServer(root: root)
         do {
             try server.start()
             guard let base = server.baseURL, let entry = entryURL(base: base) else {
                 server.stop()
+                BootEvidence.recordError("server reported no usable address")
                 phase = .failed("The embedded server did not report a usable address.")
                 return
             }
             self.server = server
+            BootEvidence.stage("entry \(entry.absoluteString)")
             phase = .running(entry)
         } catch {
+            BootEvidence.recordError("server bind failed: \(error)")
             phase = .failed("Could not start the embedded server: \(error)")
         }
     }
@@ -150,16 +202,16 @@ final class HarnessModel {
 
     func reportLoadFailure(_ message: String) {
         loadError = message
-        // The marker must not survive a failure, or a later CI run could read a
-        // stale success.
         harnessBooted = false
+        BootEvidence.recordError(message)
     }
 
     /// Record that the page reported its plugin tree live.
     func reportBooted(_ detail: String) {
         harnessBooted = true
         loadError = nil
-        // Printed so a simulator smoke test can grep it out of the launch log.
+        BootEvidence.recordBooted(detail)
+        // Printed too, so a launch that does capture stdout still shows it.
         print("\(Self.bootMarker) \(detail)")
     }
 
@@ -406,6 +458,11 @@ struct HarnessWebView: UIViewRepresentable {
         var onBooted: (String) -> Void
         var generation = 0
         private var reportedBoot = false
+        /// Bounds the forwarded console output kept on disk. The page logs its
+        /// plugin inventory, which is long enough to matter but finite; a cap
+        /// keeps a chatty failure from filling the container.
+        private static let maxConsoleLines = 400
+        private var consoleLines = 0
 
         init(onLoadError: @escaping (String) -> Void, onBooted: @escaping (String) -> Void) {
             self.onLoadError = onLoadError
@@ -414,6 +471,13 @@ struct HarnessWebView: UIViewRepresentable {
 
         func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
             guard message.name == Self.logHandlerName, let text = message.body as? String else { return }
+
+            // Keep the page's own output. Without it, a page that failed to boot
+            // is indistinguishable from one that never ran any script at all.
+            if consoleLines < Self.maxConsoleLines {
+                consoleLines += 1
+                BootEvidence.stage("console: \(text.prefix(400))")
+            }
 
             // The worker prints this once the whole plugin tree is mounted; it is
             // the strongest in-page evidence that the harness is running.
@@ -426,6 +490,15 @@ struct HarnessWebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             // A fresh navigation may reach the harness after an earlier failure.
             reportedBoot = false
+            BootEvidence.stage("navigation started")
+        }
+
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            BootEvidence.stage("content committing")
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            BootEvidence.stage("document finished")
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -434,6 +507,13 @@ struct HarnessWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             report(error)
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            // The harness holds a large VFS image in memory; a terminated content
+            // process is recoverable by reloading, not a silent blank screen.
+            BootEvidence.stage("content process terminated")
+            onLoadError("The page process was terminated. Reload to continue.")
         }
 
         /// Report only a failed top-level document, not every missing subresource.
