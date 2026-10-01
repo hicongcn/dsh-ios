@@ -48,67 +48,80 @@ struct ConversationView: View {
 
 /// Model picker plus the fork action.
 ///
-/// Extracted from the toolbar on purpose: nested `Menu → ForEach → Section →
-/// ForEach → Button → if/else` combined with optional comparisons makes Swift's
-/// type checker time out ("unable to type-check this expression in reasonable
-/// time"). Small dedicated views keep each expression shallow and give the
-/// compiler something it can solve.
+/// Extracted from the toolbar, then split further, because CI showed the Swift
+/// type checker cannot solve this shape: nesting `Menu → ForEach → Section →
+/// ForEach → Button` with optional comparisons makes it either time out or fail
+/// to emit a diagnostic at all.
+///
+/// Every value here carries an explicit type and each `@ViewBuilder` body stays
+/// shallow, which is what keeps inference tractable. Note the explicit `groups`
+/// property: `catalog?.groups ?? []` leaves the empty-array literal without a
+/// type, and that ambiguity is what tipped the checker over.
 private struct ModelMenu: View {
     let catalog: DSHModelCatalog?
     let active: DSHModelSelection?
     let onSelect: (DSHModelSelection) -> Void
     let onFork: () -> Void
 
+    private var groups: [DSHModelProviderGroup] {
+        catalog?.groups ?? []
+    }
+
     var body: some View {
         Menu {
-            ForEach(catalog?.groups ?? []) { group in
-                Section(group.name) {
-                    ForEach(group.models, id: \.id) { model in
-                        ModelMenuRow(
-                            model: model,
-                            isActive: isActive(group: group.id, model: model.id)
-                        ) {
-                            onSelect(DSHModelSelection(
-                                provider: group.id,
-                                model: model.id,
-                                reasoningEffort: nil
-                            ))
-                        }
-                    }
-                }
-            }
-
-            Divider()
-
-            Button(action: onFork) {
-                Label("Fork from here", systemImage: "arrow.triangle.branch")
-            }
+            menuItems
         } label: {
             Label("Model", systemImage: "cpu")
         }
     }
 
-    /// Whether this exact route is the one the next request will use.
-    private func isActive(group: String, model: String) -> Bool {
-        guard let active else { return false }
-        return active.provider == group && active.model == model
+    @ViewBuilder
+    private var menuItems: some View {
+        ForEach(groups) { group in
+            Section(group.name) {
+                ModelGroupRows(
+                    group: group,
+                    active: active,
+                    onSelect: onSelect
+                )
+            }
+        }
+
+        Divider()
+
+        Button {
+            onFork()
+        } label: {
+            Label("Fork from here", systemImage: "arrow.triangle.branch")
+        }
     }
 }
 
-/// One model row, with a checkmark when it is the active route.
-private struct ModelMenuRow: View {
-    let model: DSHModelCatalogModel
-    let isActive: Bool
-    let action: () -> Void
+/// The models of one provider group.
+private struct ModelGroupRows: View {
+    let group: DSHModelProviderGroup
+    let active: DSHModelSelection?
+    let onSelect: (DSHModelSelection) -> Void
 
     var body: some View {
-        Button(action: action) {
-            if isActive {
-                Label(model.name, systemImage: "checkmark")
-            } else {
-                Text(model.name)
+        ForEach(group.models, id: \.id) { model in
+            Button {
+                onSelect(DSHModelSelection(
+                    provider: group.id,
+                    model: model.id,
+                    reasoningEffort: nil
+                ))
+            } label: {
+                Text(label(for: model))
             }
         }
+    }
+
+    /// Prefix the active route so it is identifiable without a custom row view.
+    private func label(for model: DSHModelCatalogModel) -> String {
+        guard let active else { return model.name }
+        guard active.provider == group.id, active.model == model.id else { return model.name }
+        return "✓ \(model.name)"
     }
 }
 
