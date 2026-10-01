@@ -11,3 +11,11 @@ Payload/
 # project is rebuilt in CI and never committed (avoids pbxproj merge conflicts).
 DeepSeekHarness.xcodeproj/
 xcuserdata/
+
+# The embedded harness: fetched by scripts/fetch-harness-assets.sh, not source.
+# It is a build product of the upstream repository, so committing it would add
+# 16 MB of binaries that drift from whatever built them.
+Apps/DeepSeekHarnessStandalone/Resources/HarnessAssets/
+
+# Generated from the upstream brand mark by scripts/make-app-icon.py.
+Apps/DeepSeekHarnessStandalone/Resources/Assets.xcassets/AppIcon.appiconset/*.png

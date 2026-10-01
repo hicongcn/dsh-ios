@@ -1,15 +1,14 @@
 name: iOS Build
 
-# Builds the Harness iOS client on a macOS runner, where Xcode is available.
+# Builds both iOS apps on a macOS runner, where Xcode is available.
 #
-# Two independent jobs:
-#   protocol  — fast gate; DSHKit has no iOS-only dependency, so it builds and
-#               self-tests without Xcode. Runs on every push.
-#   ipa       — the actual app build. Needs Xcode, so it runs on the macOS
-#               runner and produces an installable artifact.
+#   standalone — the embedded harness: worker bundle, packed VFS image and UI
+#                shipped inside the app, so it needs no host and no network
+#                beyond the model API.
+#   client     — the thin client that drives a `dsh web` host over its protocol.
 #
-# An unsigned .ipa is produced by default. See "Signing" in README.md for the
-# secret-backed signed path, which is what installs on a physical device.
+# An unsigned .ipa is produced for each. See "Signing" in README.md for the
+# secret-backed path that installs on a physical device.
 
 on:
   push:
@@ -17,10 +16,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      build_signed:
-        description: "Also attempt a signed build (requires signing secrets)"
-        type: boolean
-        default: false
+      assets_url:
+        description: "Base URL the harness assets are fetched from"
+        type: string
+        required: false
+        default: "https://hicongcn.github.io/deepseek-harness"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   protocol:
-    name: Protocol layer + self-test
+    name: Protocol and asset-server self-tests
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,18 +36,20 @@ jobs:
       - name: Swift version
         run: swift --version
 
-      - name: Build DSHKit
+      - name: Build the packages
         run: swift build
 
-      - name: Self-test (offline checks)
+      # DSHKit has no iOS-only dependency, so the wire protocol is verifiable
+      # without Xcode. The asset server's checks matter most: one of them asserts
+      # that no request can resolve outside the served root.
+      - name: DSHKit self-test
         run: swift run dshkit-selftest
 
-      # Live checks need a reachable `dsh web` host, which a runner does not
-      # have. The suite prints a reminder and still passes, so no host is faked
-      # here — an integration test that quietly no-ops is worse than none.
+      - name: Asset server self-test
+        run: swift run dsh-asset-server-selftest
 
-  ipa:
-    name: Build app + package IPA
+  build:
+    name: Build apps + package IPAs
     runs-on: macos-latest
     needs: protocol
     steps:
@@ -57,80 +59,100 @@ jobs:
         run: |
           xcodebuild -version
           xcodebuild -showsdks | grep -i ios || true
-          swift --version
 
       - name: Install xcodegen
         run: brew install xcodegen
 
+      # The harness itself is not in this repository; it is fetched from a build
+      # of the upstream project. Failing here is preferable to shipping an app
+      # whose page cannot boot.
+      - name: Fetch the embedded harness assets
+        env:
+          HARNESS_ASSETS_URL: ${{ inputs.assets_url || 'https://hicongcn.github.io/deepseek-harness' }}
+        run: ./scripts/fetch-harness-assets.sh
+
+      - name: Generate the app icon from the harness brand mark
+        run: |
+          python3 -m pip install --quiet Pillow
+          python3 scripts/make-app-icon.py
+
       - name: Generate the Xcode project
         run: xcodegen generate
 
-      # Device build, unsigned. CODE_SIGNING_ALLOWED=NO is what lets a runner
-      # with no certificates produce a real arm64 app binary.
-      - name: Build for device (unsigned)
+      # A device build, unsigned. CODE_SIGNING_ALLOWED=NO is what lets a runner
+      # with no certificates produce a real arm64 binary.
+      - name: Build both apps for device (unsigned)
         run: |
           set -o pipefail
-          xcodebuild \
-            -project DeepSeekHarness.xcodeproj \
-            -scheme DeepSeekHarness \
-            -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            build
+          for scheme in DeepSeekHarnessStandalone DeepSeekHarnessClient; do
+            echo "=== $scheme ==="
+            xcodebuild \
+              -project DeepSeekHarness.xcodeproj \
+              -scheme "$scheme" \
+              -configuration Release \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath build \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              build
+          done
 
       # An .ipa is a zip whose root holds Payload/<App>.app. Assembling it by
-      # hand is what makes the unsigned artifact producible without a team.
-      - name: Package unsigned IPA
+      # hand is what makes an unsigned artifact producible without a team.
+      - name: Package the standalone IPA
         run: |
           set -euo pipefail
-          APP_PATH="build/Build/Products/Release-iphoneos/DeepSeekHarness.app"
-          if [ ! -d "$APP_PATH" ]; then
-            echo "App bundle not found at: $APP_PATH" >&2
-            ls -la build/Build/Products/ || true
+          APP="build/Build/Products/Release-iphoneos/DeepSeekHarness.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::standalone app bundle not found at $APP"
+            ls -la build/Build/Products/Release-iphoneos/ || true
             exit 1
           fi
+
+          # Report what the app actually carries, so a build that silently lost
+          # the harness is caught here rather than on a device.
+          echo "bundle size: $(du -sh "$APP" | cut -f1)"
+          ls -la "$APP/HarnessAssets/preview/" 2>/dev/null | head || {
+            echo "::error::the embedded harness is missing from the app bundle"
+            exit 1
+          }
+
           rm -rf artifacts Payload
           mkdir -p artifacts Payload
-          cp -R "$APP_PATH" Payload/
-          zip -qry "artifacts/DeepSeekHarness-unsigned.ipa" Payload
-          # Also keep the raw .app: it is directly usable by tooling that
-          # expects a bundle rather than a packaged archive.
-          cp -R "$APP_PATH" artifacts/
+          cp -R "$APP" Payload/
+          zip -qry "artifacts/DeepSeekHarnessStandalone-unsigned.ipa" Payload
           ls -lh artifacts
 
-      # A simulator build is genuinely useful: it runs on any Mac with Xcode,
-      # so the UI can be exercised without a signing identity.
-      - name: Build for simulator
+      - name: Package the client IPA
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/DeepSeekHarnessClient.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::client app bundle not found at $APP"
+            exit 1
+          fi
+          rm -rf Payload-client
+          mkdir -p Payload-client/Payload
+          cp -R "$APP" Payload-client/Payload/
+          (cd Payload-client && zip -qry "../artifacts/DeepSeekHarnessClient-unsigned.ipa" Payload)
+          ls -lh artifacts
+
+      # Compiling is not running. This boots a simulator, installs the
+      # standalone app, launches it, and confirms it stays alive — so a startup
+      # crash fails CI instead of being found by hand.
+      - name: Build the standalone app for the simulator
         run: |
           set -o pipefail
           xcodebuild \
             -project DeepSeekHarness.xcodeproj \
-            -scheme DeepSeekHarness \
+            -scheme DeepSeekHarnessStandalone \
             -configuration Debug \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build-sim \
             CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Package simulator app
-        run: |
-          set -euo pipefail
-          SIM_APP=$(find build-sim/Build/Products -maxdepth 2 -name "*.app" -type d | head -1)
-          if [ -z "$SIM_APP" ]; then
-            echo "Simulator app bundle not found" >&2
-            exit 1
-          fi
-          echo "Found: $SIM_APP"
-          echo "SIM_APP=$SIM_APP" >> "$GITHUB_ENV"
-          rm -rf artifacts/simulator && mkdir -p artifacts/simulator
-          cp -R "$SIM_APP" artifacts/simulator/
-
-      # Compiling is not running. This boots a simulator, installs the app, and
-      # launches it, so a crash in app startup fails the build instead of being
-      # discovered by hand later. A screenshot is captured as evidence.
       - name: Smoke-launch on a simulator
         run: |
           set -euo pipefail
@@ -147,49 +169,48 @@ jobs:
                       raise SystemExit
           raise SystemExit("no available iPhone simulator")
           ')
-          echo "Simulator: $UDID"
+          echo "simulator: $UDID"
 
           xcrun simctl boot "$UDID" || true
           xcrun simctl bootstatus "$UDID" -b
 
-          xcrun simctl install "$UDID" "$SIM_APP"
+          APP=$(find build-sim/Build/Products -maxdepth 2 -name "DeepSeekHarness.app" -type d | head -1)
+          echo "installing: $APP"
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" ai.deepseek.harness.standalone
 
-          # launch prints "<bundle-id>: <pid>"
-          xcrun simctl launch "$UDID" ai.deepseek.harness.ios
-
-          # If the process died during startup, it will not be listed.
-          sleep 6
-          if xcrun simctl spawn "$UDID" launchctl list | grep -q ai.deepseek.harness.ios; then
-            echo "App is running."
+          # Booting the harness loads 844 modules inside a worker, which takes a
+          # few seconds; give it real time before judging the launch.
+          sleep 20
+          if xcrun simctl spawn "$UDID" launchctl list | grep -q ai.deepseek.harness.standalone; then
+            echo "app is running"
           else
-            echo "::error::App is not running after launch — it likely crashed on startup."
-            xcrun simctl spawn "$UDID" log show --last 2m --predicate 'processImagePath CONTAINS "DeepSeekHarness"' 2>/dev/null | tail -40 || true
+            echo "::error::the app is not running after launch — it likely crashed"
+            xcrun simctl spawn "$UDID" log show --last 3m --predicate 'processImagePath CONTAINS "DeepSeekHarness"' 2>/dev/null | tail -40 || true
             exit 1
           fi
 
           mkdir -p artifacts/screenshots
-          xcrun simctl io "$UDID" screenshot artifacts/screenshots/connect-screen.png
+          xcrun simctl io "$UDID" screenshot artifacts/screenshots/standalone.png
           ls -lh artifacts/screenshots
 
-      - name: Upload launch screenshot
+      - name: Upload the standalone IPA
         uses: actions/upload-artifact@v4
         with:
-          name: DeepSeekHarness-screenshot
-          path: artifacts/screenshots/
-          if-no-files-found: warn
-
-      - name: Upload unsigned IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: DeepSeekHarness-unsigned-ipa
-          path: artifacts/DeepSeekHarness-unsigned.ipa
+          name: DeepSeekHarnessStandalone-unsigned-ipa
+          path: artifacts/DeepSeekHarnessStandalone-unsigned.ipa
           if-no-files-found: error
 
-      - name: Upload raw app bundles
+      - name: Upload the client IPA
         uses: actions/upload-artifact@v4
         with:
-          name: DeepSeekHarness-app-bundles
-          path: |
-            artifacts/DeepSeekHarness.app
-            artifacts/simulator/
+          name: DeepSeekHarnessClient-unsigned-ipa
+          path: artifacts/DeepSeekHarnessClient-unsigned.ipa
+          if-no-files-found: warn
+
+      - name: Upload the launch screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeekHarnessStandalone-screenshot
+          path: artifacts/screenshots/
           if-no-files-found: warn

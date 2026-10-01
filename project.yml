@@ -1,9 +1,12 @@
-# Xcode project generation for the DeepSeek Harness iOS client.
+# Xcode project generation for the standalone DeepSeek Harness iOS client.
 #
-# Usage:  xcodegen generate     (produces DeepSeekHarness.xcodeproj)
+# Usage:  xcodegen generate
 #
-# The app is a thin SwiftUI shell over the DSHKit package in this repository, so
-# the protocol layer stays buildable and testable without Xcode.
+# Two app targets share one protocol package:
+#   DeepSeekHarnessStandalone — the app being asked for: it embeds the whole
+#       harness (worker bundle + packed VFS image + UI) and runs it on device.
+#   DeepSeekHarnessClient — the thin client that drives a `dsh web` host on your
+#       computer over its HTTP/WebSocket protocol.
 name: DeepSeekHarness
 options:
   bundleIdPrefix: ai.deepseek.harness
@@ -20,13 +23,61 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    DEVELOPMENT_TEAM: ""
     CODE_SIGN_STYLE: Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     SWIFT_STRICT_CONCURRENCY: complete
 
 targets:
-  DeepSeekHarness:
+  DeepSeekHarnessStandalone:
+    type: application
+    platform: iOS
+    sources:
+      - path: Apps/DeepSeekHarnessStandalone/Sources
+      # The asset catalog is compiled, so it stays an ordinary source entry.
+      - path: Apps/DeepSeekHarnessStandalone/Resources/Assets.xcassets
+      # The bundled harness is a directory tree whose HTML references its assets
+      # by relative path. A folder reference copies `HarnessAssets` into the
+      # bundle root verbatim, which is exactly the layout the page expects;
+      # building it as a group would flatten the tree and break every lookup.
+      - path: Apps/DeepSeekHarnessStandalone/Resources/HarnessAssets
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - package: DSHKit
+        product: DSHAssetServer
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.deepseek.harness.standalone
+        PRODUCT_NAME: DeepSeekHarness
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # An explicit Info.plist carries the ATS exceptions below, so Xcode must
+        # not also synthesize one.
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: Apps/DeepSeekHarnessStandalone/Info.plist
+      properties:
+        CFBundleDisplayName: DeepSeek Harness
+        UILaunchScreen: {}
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # The harness calls the model API directly from the page. That request
+        # leaves the device, so App Transport Security applies to it normally;
+        # only the embedded loopback server and a LAN host need an exception.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            localhost:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            127.0.0.1:
+              NSExceptionAllowsInsecureHTTPLoads: true
+
+  DeepSeekHarnessClient:
     type: application
     platform: iOS
     sources:
@@ -37,42 +88,42 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.deepseek.harness.ios
-        # Deliberately no spaces: the bundle name becomes a filesystem path, and
-        # `DeepSeek Harness.app` breaks naive shell and archive tooling in CI.
-        # The name users see on the Home Screen comes from CFBundleDisplayName.
-        PRODUCT_NAME: DeepSeekHarness
+        PRODUCT_NAME: DeepSeekHarnessClient
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"
-        # An explicit Info.plist carries the ATS exceptions below, so Xcode must
-        # not also synthesize one; leaving both on makes the merged result
-        # ambiguous.
         GENERATE_INFOPLIST_FILE: NO
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
     info:
       path: Apps/DeepSeekHarness/Info.plist
       properties:
-        CFBundleDisplayName: DeepSeek Harness
+        CFBundleDisplayName: DeepSeek Harness Client
         UILaunchScreen: {}
-        NSLocalNetworkUsageDescription: "DeepSeek Harness connects to the dsh web host running on your computer to send prompts and stream replies."
-        # Allow cleartext to the specific hosts a Harness host runs on rather than
-        # globally disabling ATS: loopback for the simulator, and private LAN
-        # ranges for a device talking to your computer.
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
           NSExceptionDomains:
             localhost:
               NSExceptionAllowsInsecureHTTPLoads: true
               NSIncludesSubdomains: true
             127.0.0.1:
               NSExceptionAllowsInsecureHTTPLoads: true
-          NSAllowsLocalNetworking: true
 
 schemes:
-  DeepSeekHarness:
+  DeepSeekHarnessStandalone:
     build:
       targets:
-        DeepSeekHarness: all
+        DeepSeekHarnessStandalone: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  DeepSeekHarnessClient:
+    build:
+      targets:
+        DeepSeekHarnessClient: all
     run:
       config: Debug
     archive:

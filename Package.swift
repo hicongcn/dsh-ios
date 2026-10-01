@@ -1,11 +1,15 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-// The iOS client kit for DeepSeek Harness.
+// The iOS client for DeepSeek Harness.
 //
-// DSHKit is the platform-neutral protocol layer, so it builds and self-tests on
-// macOS without an iOS SDK present. The SwiftUI application in Apps/ is a thin
-// consumer built by Xcode against the same sources.
+// Two independent targets:
+//   DSHKit           — the wire protocol for talking to a `dsh web` host.
+//   DSHAssetServer   — the loopback asset server that lets the standalone app
+//                      run the harness entirely on device.
+//
+// Neither depends on iOS-only APIs, so both build and self-test on macOS, which
+// keeps the protocol layer verifiable without Xcode.
 let package = Package(
     name: "DSHKit",
     platforms: [
@@ -14,10 +18,22 @@ let package = Package(
     ],
     products: [
         .library(name: "DSHKit", targets: ["DSHKit"]),
+        .library(name: "DSHAssetServer", targets: ["DSHAssetServer"]),
         .executable(name: "dshkit-selftest", targets: ["DSHKitSelfTest"]),
+        .executable(name: "dsh-asset-server-selftest", targets: ["DSHAssetServerSelfTest"]),
     ],
     targets: [
         .target(name: "DSHKit", path: "Sources/DSHKit"),
-        .executableTarget(name: "DSHKitSelfTest", dependencies: ["DSHKit"], path: "Sources/DSHKitSelfTest"),
+        .target(name: "DSHAssetServer", path: "Sources/DSHAssetServer"),
+        .executableTarget(
+            name: "DSHKitSelfTest",
+            dependencies: ["DSHKit"],
+            path: "Sources/DSHKitSelfTest"
+        ),
+        .executableTarget(
+            name: "DSHAssetServerSelfTest",
+            dependencies: ["DSHAssetServer"],
+            path: "Sources/DSHAssetServerSelfTest"
+        ),
     ]
 )
