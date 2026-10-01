@@ -72,6 +72,15 @@ final class HarnessModel {
     /// Set when a load error arrives, so the UI can offer a retry.
     private(set) var loadError: String?
     private(set) var source: Source = .empty
+    /// True once the page reports its plugin tree is live.
+    ///
+    /// A running process is not a running harness: WebKit's own error page keeps
+    /// the process alive while showing nothing. This flag is the difference.
+    private(set) var harnessBooted = false
+
+    /// The marker CI greps for. Emitted on stdout and in the log so a smoke test
+    /// can assert the harness booted instead of only that the app launched.
+    static let bootMarker = "DSH_HARNESS_BOOTED"
 
     @ObservationIgnored private var server: LocalAssetServer?
     /// Bumped to force SwiftUI to rebuild the web view for a genuine reload.
@@ -81,13 +90,18 @@ final class HarnessModel {
     private static let entryPath = "preview.html"
 
     /// The entry URL carrying the source selection.
+    ///
+    /// Built from absolute components on purpose. `URLComponents(url:relativeTo:)`
+    /// with `resolvingAgainstBaseURL: false` keeps a relative URL relative, so
+    /// the result loses scheme, host and port — the web view then reports "The
+    /// URL can't be shown". Starting from the absolute URL avoids that entirely.
     private func entryURL(base: URL) -> URL? {
-        var components = URLComponents(
-            url: URL(string: Self.entryPath, relativeTo: base)!,
+        guard var components = URLComponents(
+            url: base.appendingPathComponent(Self.entryPath),
             resolvingAgainstBaseURL: false
-        )
-        components?.queryItems = [URLQueryItem(name: "preview-fixture", value: source.rawValue)]
-        return components?.url
+        ) else { return nil }
+        components.queryItems = [URLQueryItem(name: "preview-fixture", value: source.rawValue)]
+        return components.url
     }
 
     func start() async {
@@ -124,6 +138,7 @@ final class HarnessModel {
     /// Reload the harness from the bundled assets.
     func reload() {
         loadError = nil
+        harnessBooted = false
 
         // Rebuilding the web view is the only reliable reset; the URL must be
         // recomputed because the source may have changed.
@@ -135,6 +150,17 @@ final class HarnessModel {
 
     func reportLoadFailure(_ message: String) {
         loadError = message
+        // The marker must not survive a failure, or a later CI run could read a
+        // stale success.
+        harnessBooted = false
+    }
+
+    /// Record that the page reported its plugin tree live.
+    func reportBooted(_ detail: String) {
+        harnessBooted = true
+        loadError = nil
+        // Printed so a simulator smoke test can grep it out of the launch log.
+        print("\(Self.bootMarker) \(detail)")
     }
 
     func shutdown() {
@@ -154,9 +180,12 @@ struct ContentView: View {
             case .idle, .starting:
                 StartupView()
             case .running(let url):
-                HarnessWebView(url: url, generation: model.generation) { message in
-                    model.reportLoadFailure(message)
-                }
+                HarnessWebView(
+                    url: url,
+                    generation: model.generation,
+                    onLoadError: { model.reportLoadFailure($0) },
+                    onBooted: { model.reportBooted($0) }
+                )
                 .ignoresSafeArea(edges: .bottom)
                 .overlay(alignment: .topTrailing) { SourceMenu() }
             case .failed(let message):
@@ -168,6 +197,22 @@ struct ContentView: View {
         .overlay(alignment: .top) {
             if let error = model.loadError {
                 LoadErrorBanner(message: error) { model.reload() }
+            }
+        }
+        .overlay(alignment: .bottom) {
+            // Until the page reports its plugin tree, say so. Without this a slow
+            // first boot is indistinguishable from a page that failed to load.
+            if !model.harnessBooted, model.loadError == nil, case .running = model.phase {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Starting the harness…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.thinMaterial, in: Capsule())
+                .padding(.bottom, 16)
             }
         }
     }
@@ -277,22 +322,34 @@ struct HarnessWebView: UIViewRepresentable {
     let url: URL
     let generation: Int
     let onLoadError: (String) -> Void
+    /// Called once the harness reports that its plugin tree is live.
+    let onBooted: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onLoadError: onLoadError)
+        Coordinator(onLoadError: onLoadError, onBooted: onBooted)
     }
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+
+        // The harness announces its progress with console.log, including the
+        // "tree active" line the worker emits once the plugin tree is up.
+        // Forwarding console output is what lets the app — and CI — assert that
+        // the harness actually booted, rather than that a process merely exists.
+        let controller = WKUserContentController()
+        controller.add(context.coordinator, name: Coordinator.logHandlerName)
+        controller.addUserScript(WKUserScript(
+            source: Coordinator.consoleForwarder,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
+        configuration.userContentController = controller
 
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.navigationDelegate = context.coordinator
         view.allowsBackForwardNavigationGestures = false
-        // The harness UI is a fixed layout; letting it bounce behind the
-        // keyboard makes the composer awkward to use.
         view.scrollView.keyboardDismissMode = .interactive
         view.scrollView.contentInsetAdjustmentBehavior = .never
         view.load(URLRequest(url: url))
@@ -301,8 +358,8 @@ struct HarnessWebView: UIViewRepresentable {
 
     func updateUIView(_ view: WKWebView, context: Context) {
         context.coordinator.onLoadError = onLoadError
+        context.coordinator.onBooted = onBooted
 
-        // A generation change means an explicit reload was requested.
         guard context.coordinator.generation != generation else { return }
         context.coordinator.generation = generation
         view.stopLoading()
@@ -310,12 +367,65 @@ struct HarnessWebView: UIViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        var onLoadError: (String) -> Void
-        var generation = 0
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        static let logHandlerName = "dshLog"
 
-        init(onLoadError: @escaping (String) -> Void) {
+        /// Mirror console output to the native side.
+        ///
+        /// Installed before any page script runs so nothing is missed, and it
+        /// re-throws nothing: a failure to post must never break the page.
+        static let consoleForwarder = """
+        (function () {
+          var post = function (level, args) {
+            try {
+              window.webkit.messageHandlers.\(logHandlerName).postMessage(
+                level + '\\u0000' + args.map(function (a) {
+                  try { return typeof a === 'string' ? a : JSON.stringify(a); }
+                  catch (e) { return String(a); }
+                }).join(' ')
+              );
+            } catch (e) {}
+          };
+          ['log', 'info', 'warn', 'error'].forEach(function (key) {
+            var original = console[key];
+            console[key] = function () {
+              post(key, Array.prototype.slice.call(arguments));
+              if (original) original.apply(console, arguments);
+            };
+          });
+          window.addEventListener('error', function (event) {
+            post('error', [event.message || 'script error']);
+          });
+          window.addEventListener('unhandledrejection', function (event) {
+            post('error', ['unhandled rejection: ' + String(event.reason)]);
+          });
+        })();
+        """
+
+        var onLoadError: (String) -> Void
+        var onBooted: (String) -> Void
+        var generation = 0
+        private var reportedBoot = false
+
+        init(onLoadError: @escaping (String) -> Void, onBooted: @escaping (String) -> Void) {
             self.onLoadError = onLoadError
+            self.onBooted = onBooted
+        }
+
+        func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == Self.logHandlerName, let text = message.body as? String else { return }
+
+            // The worker prints this once the whole plugin tree is mounted; it is
+            // the strongest in-page evidence that the harness is running.
+            if !reportedBoot, text.contains("tree active") {
+                reportedBoot = true
+                onBooted(text)
+            }
+        }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            // A fresh navigation may reach the harness after an earlier failure.
+            reportedBoot = false
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -328,9 +438,9 @@ struct HarnessWebView: UIViewRepresentable {
 
         /// Report only a failed top-level document, not every missing subresource.
         ///
-        /// The deployed preview shows two benign 404s (the HMR event channel and
-        /// the desktop open-in-app route, neither of which the tunnel serves), and
-        /// surfacing those as errors would train the user to ignore the banner.
+        /// The page requests two paths the tunnel does not serve (the HMR event
+        /// channel and the desktop open-in-app route); surfacing those as errors
+        /// would train the user to ignore the banner.
         private func report(_ error: Error) {
             let code = (error as NSError).code
             // -999 is a cancelled load, which happens on an intentional reload.

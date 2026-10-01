@@ -65,17 +65,23 @@ targets:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        # The harness calls the model API directly from the page. That request
-        # leaves the device, so App Transport Security applies to it normally;
-        # only the embedded loopback server and a LAN host need an exception.
+        # The app loads its own bundle over loopback HTTP, because a Web Worker
+        # needs an origin and a file:// page has none.
+        #
+        # NSExceptionDomains keys must be domain names — an IP literal is not a
+        # valid key, so a "127.0.0.1" entry is silently ignored and the load
+        # fails with WebKit's "The URL can't be shown". NSAllowsLocalNetworking
+        # does not cover loopback either, which is not a private address range.
+        # NSAllowsArbitraryLoadsInWebContent is the key that actually applies:
+        # it relaxes ATS for web view content only, leaving the app's own
+        # URLSession traffic subject to ATS.
         NSAppTransportSecurity:
+          NSAllowsArbitraryLoadsInWebContent: true
           NSAllowsLocalNetworking: true
           NSExceptionDomains:
             localhost:
               NSExceptionAllowsInsecureHTTPLoads: true
               NSIncludesSubdomains: true
-            127.0.0.1:
-              NSExceptionAllowsInsecureHTTPLoads: true
 
   DeepSeekHarnessClient:
     type: application

@@ -185,21 +185,45 @@ jobs:
           APP=$(find build-sim/Build/Products -maxdepth 2 -name "DeepSeekHarness.app" -type d | head -1)
           echo "installing: $APP"
           xcrun simctl install "$UDID" "$APP"
-          xcrun simctl launch "$UDID" ai.deepseek.harness.standalone
 
-          # Booting the harness loads 844 modules inside a worker, which takes a
-          # few seconds; give it real time before judging the launch.
-          sleep 20
-          if xcrun simctl spawn "$UDID" launchctl list | grep -q ai.deepseek.harness.standalone; then
-            echo "app is running"
-          else
-            echo "::error::the app is not running after launch — it likely crashed"
-            xcrun simctl spawn "$UDID" log show --last 3m --predicate 'processImagePath CONTAINS "DeepSeekHarness"' 2>/dev/null | tail -40 || true
-            exit 1
-          fi
+          # Capture stdout, because the app prints a marker once the page reports
+          # its plugin tree live.
+          LOG="$RUNNER_TEMP/launch.log"
+          xcrun simctl launch --console-pty "$UDID" ai.deepseek.harness.standalone > "$LOG" 2>&1 &
+          LAUNCH_PID=$!
+
+          # Booting the harness inflates a 14 MB image and mounts 844 modules
+          # inside a worker; that is real CPU work, so wait for the marker rather
+          # than for a fixed sleep.
+          BOOTED=0
+          for _ in $(seq 1 36); do
+            sleep 5
+            if grep -q "DSH_HARNESS_BOOTED" "$LOG" 2>/dev/null; then
+              BOOTED=1
+              break
+            fi
+          done
+
+          echo "--- launch log (tail) ---"
+          tail -40 "$LOG" || true
+          echo "-------------------------"
 
           mkdir -p artifacts/screenshots
           xcrun simctl io "$UDID" screenshot artifacts/screenshots/standalone.png
+
+          # A live process is not a booted harness: WebKit's own "The URL can't be
+          # shown" error page keeps the process alive while rendering nothing.
+          # Requiring the in-page marker is what catches that class of failure.
+          if [ "$BOOTED" -ne 1 ]; then
+            echo "::error::the harness never reported its plugin tree; the page did not boot"
+            xcrun simctl spawn "$UDID" log show --last 3m --predicate 'processImagePath CONTAINS "DeepSeekHarness"' 2>/dev/null | tail -60 || true
+            kill "$LAUNCH_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "harness booted:"
+          grep "DSH_HARNESS_BOOTED" "$LOG" | head -3
+
+          kill "$LAUNCH_PID" 2>/dev/null || true
           ls -lh artifacts/screenshots
 
       - name: Upload the standalone IPA
